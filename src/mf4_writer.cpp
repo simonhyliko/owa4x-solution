@@ -197,12 +197,16 @@ bool Mf4Writer::initialize_channel_groups() {
 }
 
 bool Mf4Writer::create_new_file() {
+    // Flush any buffered messages before rolling the file to avoid losing data
+    flush_message_buffer();
+
     close_current_file();
     
     current_file_path_ = generate_filename();
     current_file_size_ = 0;
     channel_groups_.clear();
     message_buffer_.clear();
+    buffered_signal_count_ = 0;
     measurement_started_ = false;
     measurement_start_ns_ = 0;
     measurement_start_system_ = std::chrono::system_clock::time_point{};
@@ -274,6 +278,7 @@ void Mf4Writer::close_current_file() {
     data_group_ = nullptr;
     channel_groups_.clear();
     message_buffer_.clear();
+    buffered_signal_count_ = 0;
     measurement_started_ = false;
     measurement_start_ns_ = 0;
     measurement_start_system_ = std::chrono::system_clock::time_point{};
@@ -311,17 +316,17 @@ void Mf4Writer::write_signal(const DecodedSignal& signal) {
         return;
     }
     
-    // Convert timestamp to nanoseconds for grouping (precision: millisecond)
-    auto ns_since_epoch = signal.timestamp.time_since_epoch();
-    uint64_t timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(ns_since_epoch).count();
+    // Convert timestamp to nanoseconds to preserve per-frame precision
+    const auto ns_since_epoch = signal.timestamp.time_since_epoch();
+    const uint64_t timestamp_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(ns_since_epoch).count();
     
-    // Group signals by CAN ID and timestamp (millisecond precision)
-    std::pair<uint32_t, uint64_t> message_key = {signal.can_id, timestamp_ms};
+    // Group signals by CAN ID and exact timestamp
+    std::pair<uint32_t, uint64_t> message_key = {signal.can_id, timestamp_ns};
     message_buffer_[message_key].push_back(signal);
     
-    // si assez de données, on flush le buffer
-    static int buffer_count = 0;
-    if (++buffer_count % 50 == 0) { // flush toutes 50 entrees
+    // Flush periodically to keep latency bounded
+    if (++buffered_signal_count_ >= 50) { // flush toutes 50 entrées
         flush_message_buffer();
     }
 }
@@ -423,6 +428,7 @@ void Mf4Writer::flush_message_buffer() {
     }
     
     message_buffer_.clear();
+    buffered_signal_count_ = 0;
 }
 
 void Mf4Writer::writer_loop() {
@@ -440,6 +446,7 @@ void Mf4Writer::writer_loop() {
         if (input_queue_->wait_and_pop(signal, std::chrono::milliseconds(100))) {
             // Check if we need to rotate the file
             if (current_file_size_ >= MAX_FILE_SIZE) {
+                flush_message_buffer();
                 if (!create_new_file()) {
                     std::cerr << "Failed to create new MF4 file, stopping writer" << std::endl;
                     break;
@@ -453,6 +460,7 @@ void Mf4Writer::writer_loop() {
             if (std::chrono::duration_cast<std::chrono::seconds>(now - last_flush).count() >= 5) {
                 // Force flush of pending data to disk
                 std::cout << "Flushing MF4 data to disk..." << std::endl;
+                flush_message_buffer();
                 last_flush = now;
             }
         }

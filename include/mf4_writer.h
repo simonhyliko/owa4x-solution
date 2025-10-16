@@ -68,6 +68,7 @@ private:
     
     // Buffer pour regrouper les signaux par message et timestamp
     std::map<std::pair<uint32_t, uint64_t>, std::vector<DecodedSignal>> message_buffer_;
+    size_t buffered_signal_count_ = 0;
 
     // Gestion du temps de mesure
     std::chrono::steady_clock::time_point measurement_start_steady_;
