@@ -116,7 +116,6 @@ int main(int argc, char* argv[]) {
     
     // Create thread-safe queues
     auto raw_frames_queue = std::make_shared<ThreadSafeQueue<CanFrame>>();
-    auto decoded_signals_queue = std::make_shared<ThreadSafeQueue<DecodedSignal>>();
     
     // Create components
     auto can_reader = std::make_unique<CanReader>(config.can_interface);
@@ -138,22 +137,23 @@ int main(int argc, char* argv[]) {
     
     // Start components
     std::cout << "Starting components..." << std::endl;
+
+    if (!mf4_writer->start()) {
+        std::cerr << "Failed to start MF4 writer" << std::endl;
+        return 1;
+    }
+    
+    if (!dbc_decoder->start(raw_frames_queue, mf4_writer.get())) {
+        std::cerr << "Failed to start DBC decoder" << std::endl;
+        mf4_writer->stop();
+        return 1;
+    }
     
     if (!can_reader->start(raw_frames_queue)) {
         std::cerr << "Failed to start CAN reader" << std::endl;
-        return 1;
-    }
-    
-    if (!dbc_decoder->start(raw_frames_queue, decoded_signals_queue)) {
-        std::cerr << "Failed to start DBC decoder" << std::endl;
         can_reader->stop();
-        return 1;
-    }
-    
-    if (!mf4_writer->start(decoded_signals_queue)) {
-        std::cerr << "Failed to start MF4 writer" << std::endl;
         dbc_decoder->stop();
-        can_reader->stop();
+        mf4_writer->stop();
         return 1;
     }
     
@@ -182,7 +182,6 @@ int main(int argc, char* argv[]) {
     // Print final statistics
     std::cout << "Final queue sizes:\n"
               << "  Raw frames: " << raw_frames_queue->size() << "\n"
-              << "  Decoded signals: " << decoded_signals_queue->size() << "\n"
               << std::endl;
     
     std::cout << "CAN Socket Collector stopped gracefully." << std::endl;

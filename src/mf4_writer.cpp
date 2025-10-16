@@ -5,6 +5,8 @@
 #include <chrono>
 #include <vector>
 #include <fstream>
+#include <cmath>
+#include <atomic>
 #include <mdf/mdfwriter.h>
 #include <mdf/mdffactory.h>
 #include <mdf/idatagroup.h>
@@ -17,7 +19,6 @@
 Mf4Writer::Mf4Writer(const std::string& output_dir, const std::string& dbc_file) 
     : output_directory_(output_dir)
     , dbc_file_path_(dbc_file)
-    , running_(false)
     , current_file_size_(0)
     , data_group_(nullptr)
     , measurement_start_ns_(0) {
@@ -197,16 +198,11 @@ bool Mf4Writer::initialize_channel_groups() {
 }
 
 bool Mf4Writer::create_new_file() {
-    // Flush any buffered messages before rolling the file to avoid losing data
-    flush_message_buffer();
-
     close_current_file();
     
     current_file_path_ = generate_filename();
     current_file_size_ = 0;
     channel_groups_.clear();
-    message_buffer_.clear();
-    buffered_signal_count_ = 0;
     measurement_started_ = false;
     measurement_start_ns_ = 0;
     measurement_start_system_ = std::chrono::system_clock::time_point{};
@@ -234,13 +230,9 @@ bool Mf4Writer::create_new_file() {
         // Initialize measurement after channel configuration
         mdf_writer_->InitMeasurement();
 
-        // Capture measurement start references and start measurement immediately
-        measurement_start_steady_ = std::chrono::steady_clock::now();
-        measurement_start_system_ = std::chrono::system_clock::now();
-        measurement_start_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            measurement_start_system_.time_since_epoch()).count();
-        mdf_writer_->StartMeasurement(measurement_start_ns_);
-        measurement_started_ = true;
+        // DO NOT start measurement yet - defer until first sample
+        // This prevents timestamp resets when frames arrive before StartMeasurement
+        measurement_started_ = false;
         
         std::cout << "Created new MF4 file: " << current_file_path_ << std::endl;
         return true;
@@ -277,8 +269,6 @@ void Mf4Writer::close_current_file() {
     
     data_group_ = nullptr;
     channel_groups_.clear();
-    message_buffer_.clear();
-    buffered_signal_count_ = 0;
     measurement_started_ = false;
     measurement_start_ns_ = 0;
     measurement_start_system_ = std::chrono::system_clock::time_point{};
@@ -311,34 +301,46 @@ mdf::IChannel* Mf4Writer::get_or_create_channel(ChannelGroupInfo* cg_info, const
     return nullptr;
 }
 
-void Mf4Writer::write_signal(const DecodedSignal& signal) {
-    if (!mdf_writer_ || !data_group_) {
-        return;
-    }
-    
-    // Convert timestamp to nanoseconds to preserve per-frame precision
-    const auto ns_since_epoch = signal.timestamp.time_since_epoch();
-    const uint64_t timestamp_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(ns_since_epoch).count();
-    
-    // Group signals by CAN ID and exact timestamp
-    std::pair<uint32_t, uint64_t> message_key = {signal.can_id, timestamp_ns};
-    message_buffer_[message_key].push_back(signal);
-    
-    // Flush periodically to keep latency bounded
-    if (++buffered_signal_count_ >= 50) { // flush toutes 50 entrées
-        flush_message_buffer();
-    }
-}
-
-void Mf4Writer::write_can_message(const CanMessage& message) {
+void Mf4Writer::write_can_message_internal(const CanMessage& message) {
     if (!mdf_writer_ || !data_group_ || message.signals.empty()) {
         return;
     }
-
-    if (!measurement_started_) {
-        std::cerr << "Attempted to write CAN message before measurement start. Skipping sample." << std::endl;
+    
+    // PROTECTION: Don't write if we're shutting down
+    if (shutdown_requested_.load()) {
+        static int dropped_count = 0;
+        if (++dropped_count <= 5) {
+            std::cout << "🛑 Dropping message during shutdown (CAN ID 0x" 
+                      << std::hex << message.can_id << std::dec << ")" << std::endl;
+        }
         return;
+    }
+
+    // Start measurement on first sample to anchor timebase to first frame
+    if (!measurement_started_) {
+        measurement_start_steady_ = message.timestamp;  // Anchor to first frame timestamp
+        measurement_start_system_ = std::chrono::system_clock::now();
+        measurement_start_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            measurement_start_system_.time_since_epoch()).count();
+        
+        mdf_writer_->StartMeasurement(measurement_start_ns_);
+        measurement_started_ = true;
+        
+        std::cout << "🚀 Started MF4 measurement anchored to first CAN frame (ID 0x" 
+                  << std::hex << message.can_id << std::dec << ")" << std::endl;
+    }
+    
+    // PROTECTION: Reject messages with timestamps older than our measurement start
+    // This can happen during file rotation or if there are buffered old messages
+    auto delta = message.timestamp - measurement_start_steady_;
+    if (delta < std::chrono::steady_clock::duration::zero()) {
+        static int rejected_count = 0;
+        if (++rejected_count <= 10) {  // Log only first 10 rejections to avoid spam
+            auto delta_ms = std::chrono::duration_cast<std::chrono::milliseconds>(delta).count();
+            std::cerr << "🚫 REJECTED old message (CAN ID 0x" << std::hex << message.can_id << std::dec 
+                      << ", " << delta_ms << "ms before measurement start)" << std::endl;
+        }
+        return;  // Skip this message
     }
     
     // Obtenir ou créer le channel group pour ce message CAN
@@ -352,6 +354,25 @@ void Mf4Writer::write_can_message(const CanMessage& message) {
         const uint64_t timestamp_ns = compute_absolute_timestamp(message.timestamp);
         const double relative_seconds = compute_relative_seconds(message.timestamp);
 
+        // Debug: Log suspicious timestamps
+        static int message_count = 0;
+        message_count++;
+        
+        // Only flag truly suspicious timestamps (not the first message at 0.0)
+        if ((relative_seconds < 0.0 || relative_seconds > 1000000.0) && message_count > 1) {
+            std::cerr << "⚠️  SUSPICIOUS TIMESTAMP detected!" << std::endl;
+            std::cerr << "   Message #" << message_count << ", CAN ID 0x" << std::hex << message.can_id << std::dec << std::endl;
+            std::cerr << "   Relative seconds: " << std::fixed << std::setprecision(9) << relative_seconds << std::endl;
+            std::cerr << "   Timestamp NS: " << timestamp_ns << std::endl;
+            std::cerr << "   Measurement started: " << (measurement_started_ ? "YES" : "NO") << std::endl;
+            if (measurement_started_) {
+                auto delta = message.timestamp - measurement_start_steady_;
+                auto delta_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(delta).count();
+                std::cerr << "   Delta from start (ns): " << delta_ns << std::endl;
+            }
+            std::cerr << "   Signals in message: " << message.signals.size() << std::endl;
+        }
+
         if (cg_info->master_channel) {
             cg_info->master_channel->SetChannelValue(relative_seconds);
         }
@@ -360,19 +381,56 @@ void Mf4Writer::write_can_message(const CanMessage& message) {
         for (const auto& signal : message.signals) {
             auto* channel = get_or_create_channel(cg_info, signal);
             if (channel) {
-                channel->SetChannelValue(signal.value);
+                double safe_value = signal.value;
+                
+                // PROTECTION: Sanitize extreme signal values
+                if (std::isnan(safe_value) || std::isinf(safe_value)) {
+                    std::cerr << "🔧 SANITIZED NaN/Inf signal: " << signal.signal_name 
+                              << " (was " << signal.value << ") -> 0.0" << std::endl;
+                    safe_value = 0.0;
+                } else if (std::abs(safe_value) > 1e12) {
+                    std::cerr << "🔧 SANITIZED extreme signal: " << signal.signal_name 
+                              << " (was " << signal.value << ") -> clamped" << std::endl;
+                    safe_value = (safe_value > 0) ? 1e12 : -1e12;
+                }
+                
+                channel->SetChannelValue(safe_value);
             }
         }
         
         // Save the complete sample to the channel group (all signals at once)
         mdf_writer_->SaveSample(*cg_info->channel_group, timestamp_ns);
         
-        // Debug: Log occasionally
-        static int message_count = 0;
-        if (++message_count % 20 == 0) {
+        // Debug: Log occasionally with signal values
+        if (message_count % 100 == 0) {
             std::cout << "Written " << message_count << " CAN messages, last: CAN ID 0x" 
                       << std::hex << message.can_id << std::dec
-                      << " with " << message.signals.size() << " signals" << std::endl;
+                      << " with " << message.signals.size() << " signals, time=" 
+                      << std::fixed << std::setprecision(3) << relative_seconds << "s" << std::endl;
+            
+            // Log first few signal values for debugging
+            std::cout << "  Signal values: ";
+            int signal_count = 0;
+            for (const auto& signal : message.signals) {
+                if (signal_count++ < 3) {  // Show only first 3 signals
+                    std::cout << signal.signal_name << "=" << signal.value << " ";
+                }
+            }
+            if (message.signals.size() > 3) {
+                std::cout << "... (+" << (message.signals.size() - 3) << " more)";
+            }
+            std::cout << std::endl;
+        }
+        
+        // Special logging for the last few messages before stopping
+        static bool stopping_logged = false;
+        if (message_count > 990 && !stopping_logged) {
+            std::cout << "📊 Final messages - Message #" << message_count 
+                      << ", time=" << std::fixed << std::setprecision(6) << relative_seconds << "s" << std::endl;
+            for (const auto& signal : message.signals) {
+                std::cout << "  " << signal.signal_name << " = " << signal.value << std::endl;
+            }
+            if (message_count > 999) stopping_logged = true;
         }
         
         // Update file size estimation
@@ -412,89 +470,9 @@ double Mf4Writer::compute_relative_seconds(const std::chrono::steady_clock::time
     return static_cast<double>(delta_ns.count()) / 1'000'000'000.0;
 }
 
-void Mf4Writer::flush_message_buffer() {
-    for (const auto& entry : message_buffer_) {
-        const auto& message_key = entry.first;
-        const auto& signals = entry.second;
-        
-        if (!signals.empty()) {
-            CanMessage message;
-            message.can_id = message_key.first;
-            message.timestamp = signals[0].timestamp; // Tous les signaux ont le même timestamp
-            message.signals = signals;
-            
-            write_can_message(message);
-        }
-    }
-    
-    message_buffer_.clear();
-    buffered_signal_count_ = 0;
-}
-
-void Mf4Writer::writer_loop() {
-    std::cout << "MF4 Writer thread started" << std::endl;
-    
-    if (!create_new_file()) {
-        std::cerr << "Failed to create initial MF4 file" << std::endl;
-        return;
-    }
-    
-    DecodedSignal signal;
-    auto last_flush = std::chrono::steady_clock::now();
-    
-    while (running_.load()) {
-        if (input_queue_->wait_and_pop(signal, std::chrono::milliseconds(100))) {
-            // Check if we need to rotate the file
-            if (current_file_size_ >= MAX_FILE_SIZE) {
-                flush_message_buffer();
-                if (!create_new_file()) {
-                    std::cerr << "Failed to create new MF4 file, stopping writer" << std::endl;
-                    break;
-                }
-            }
-            
-            write_signal(signal);
-            
-            // Periodic flush (every 5 seconds)
-            auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_flush).count() >= 5) {
-                // Force flush of pending data to disk
-                std::cout << "Flushing MF4 data to disk..." << std::endl;
-                flush_message_buffer();
-                last_flush = now;
-            }
-        }
-    }
-    
-    // Flush remaining buffered messages
-    flush_message_buffer();
-    
-    // Process remaining signals in queue before stopping
-    int remaining = 0;
-    while (input_queue_->pop(signal)) {
-        write_signal(signal);
-        remaining++;
-    }
-    
-    // Final flush
-    flush_message_buffer();
-    
-    if (remaining > 0) {
-        std::cout << "Processed " << remaining << " remaining signals before shutdown" << std::endl;
-    }
-    
-    close_current_file();
-    std::cout << "MF4 Writer thread stopped" << std::endl;
-}
-
-bool Mf4Writer::start(std::shared_ptr<ThreadSafeQueue<DecodedSignal>> input_queue) {
-    if (running_.load()) {
-        std::cerr << "MF4 Writer already running" << std::endl;
-        return false;
-    }
-    
-    if (!input_queue) {
-        std::cerr << "Invalid input queue provided to MF4 Writer" << std::endl;
+bool Mf4Writer::start() {
+    if (mdf_writer_) {
+        std::cerr << "MF4 Writer already started" << std::endl;
         return false;
     }
 
@@ -502,27 +480,38 @@ bool Mf4Writer::start(std::shared_ptr<ThreadSafeQueue<DecodedSignal>> input_queu
         std::cerr << "MF4 Writer cannot start without DBC definitions." << std::endl;
         return false;
     }
-    
-    input_queue_ = input_queue;
-    
-    running_.store(true);
-    writer_thread_ = std::make_unique<std::thread>(&Mf4Writer::writer_loop, this);
-    
+
+    if (!create_new_file()) {
+        std::cerr << "MF4 Writer failed to create initial MF4 file." << std::endl;
+        return false;
+    }
+
     return true;
 }
 
-void Mf4Writer::stop() {
-    if (running_.load()) {
-        running_.store(false);
-        
-        if (writer_thread_ && writer_thread_->joinable()) {
-            writer_thread_->join();
-        }
-        
-        close_current_file();
-        input_queue_.reset();
-        writer_thread_.reset();
-        
-        std::cout << "MF4 Writer stopped" << std::endl;
+void Mf4Writer::write_can_message(const CanMessage& message) {
+    if (!mdf_writer_) {
+        std::cerr << "MF4 Writer backend not available. Dropping message." << std::endl;
+        return;
     }
+
+    if (current_file_size_ >= MAX_FILE_SIZE) {
+        std::cout << "MF4 file reached max size, rotating..." << std::endl;
+        if (!create_new_file()) {
+            std::cerr << "Failed to rotate MF4 file. Message dropped." << std::endl;
+            return;
+        }
+    }
+
+    write_can_message_internal(message);
+}
+
+void Mf4Writer::stop() {
+    // Signal to stop accepting new messages
+    shutdown_requested_.store(true);
+    
+    std::cout << "🛑 MF4 Writer stopping - no more messages will be accepted" << std::endl;
+    
+    close_current_file();
+    std::cout << "MF4 Writer stopped" << std::endl;
 }

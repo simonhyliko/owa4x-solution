@@ -14,13 +14,15 @@ namespace dbcppp {
     class ISignal;
 }
 
+class Mf4Writer;
+
 class DbcDecoder {
 private:
     std::string dbc_file_path_;
     std::atomic<bool> running_;
     std::shared_ptr<ThreadSafeQueue<CanFrame>> input_queue_;
-    std::shared_ptr<ThreadSafeQueue<DecodedSignal>> output_queue_;
     std::unique_ptr<std::thread> decoder_thread_;
+    Mf4Writer* writer_ = nullptr;
     
     std::unique_ptr<dbcppp::INetwork> network_;
     std::unordered_map<uint32_t, const dbcppp::IMessage*> message_map_;
@@ -38,7 +40,7 @@ public:
     DbcDecoder& operator=(const DbcDecoder&) = delete;
 
     bool start(std::shared_ptr<ThreadSafeQueue<CanFrame>> input_queue,
-               std::shared_ptr<ThreadSafeQueue<DecodedSignal>> output_queue);
+               Mf4Writer* writer);
     void stop();
     bool is_running() const { return running_.load(); }
 };

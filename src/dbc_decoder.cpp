@@ -1,7 +1,9 @@
 #include "dbc_decoder.h"
 #include <iostream>
 #include <fstream>
+#include <cmath>
 #include <dbcppp/Network.h>
+#include "mf4_writer.h"
 
 DbcDecoder::DbcDecoder(const std::string& dbc_file) 
     : dbc_file_path_(dbc_file)
@@ -50,21 +52,48 @@ void DbcDecoder::decode_frame(const CanFrame& frame) {
 
     const dbcppp::IMessage* message = it->second;
     
+    if (!writer_) {
+        return;
+    }
+
     try {
-        // Decode all signals in this message
+        CanMessage decoded_message;
+        decoded_message.can_id = frame.can_id;
+        decoded_message.timestamp = frame.timestamp;
+
+        // Debug: Check for timestamp issues at decode time
+        static auto first_frame_time = std::chrono::steady_clock::time_point{};
+        static bool first_frame_logged = false;
+        
+        if (!first_frame_logged) {
+            first_frame_time = frame.timestamp;
+            first_frame_logged = true;
+            std::cout << "🔍 First CAN frame decoded at decoder level" << std::endl;
+        }
+        
+        auto time_since_first = frame.timestamp - first_frame_time;
+        auto time_since_first_ms = std::chrono::duration_cast<std::chrono::milliseconds>(time_since_first).count();
+        
         for (const auto& signal : message->Signals()) {
             double raw_value = signal.RawToPhys(signal.Decode(frame.data));
-            
-            DecodedSignal decoded_signal(
+
+            // Debug: Log suspicious decoded values
+            if (std::abs(raw_value) > 1e12 || std::isnan(raw_value) || std::isinf(raw_value)) {
+                std::cerr << "⚠️  SUSPICIOUS DECODED VALUE from DBC: " << signal.Name() 
+                          << " = " << raw_value << " (CAN ID 0x" << std::hex << frame.can_id << std::dec 
+                          << ", time since first: " << time_since_first_ms << "ms)" << std::endl;
+            }
+
+            decoded_message.signals.emplace_back(
                 frame.can_id,
                 signal.Name(),
                 raw_value,
                 signal.Unit(),
                 frame.timestamp
             );
-            
-            output_queue_->push(std::move(decoded_signal));
         }
+
+        writer_->write_can_message(decoded_message);
     } catch (const std::exception& e) {
         std::cerr << "Error decoding CAN frame ID 0x" << std::hex << frame.can_id 
                   << ": " << e.what() << std::dec << std::endl;
@@ -90,14 +119,14 @@ void DbcDecoder::decoder_loop() {
 }
 
 bool DbcDecoder::start(std::shared_ptr<ThreadSafeQueue<CanFrame>> input_queue,
-                       std::shared_ptr<ThreadSafeQueue<DecodedSignal>> output_queue) {
+                       Mf4Writer* writer) {
     if (running_.load()) {
         std::cerr << "DBC Decoder already running" << std::endl;
         return false;
     }
 
-    if (!input_queue || !output_queue) {
-        std::cerr << "Invalid queues provided to DBC Decoder" << std::endl;
+    if (!input_queue || !writer) {
+        std::cerr << "Invalid resources provided to DBC Decoder" << std::endl;
         return false;
     }
 
@@ -106,7 +135,7 @@ bool DbcDecoder::start(std::shared_ptr<ThreadSafeQueue<CanFrame>> input_queue,
     }
 
     input_queue_ = input_queue;
-    output_queue_ = output_queue;
+    writer_ = writer;
 
     running_.store(true);
     decoder_thread_ = std::make_unique<std::thread>(&DbcDecoder::decoder_loop, this);
@@ -123,10 +152,10 @@ void DbcDecoder::stop() {
         }
         
         input_queue_.reset();
-        output_queue_.reset();
         decoder_thread_.reset();
         network_.reset();
         message_map_.clear();
+        writer_ = nullptr;
         
         std::cout << "DBC Decoder stopped" << std::endl;
     }

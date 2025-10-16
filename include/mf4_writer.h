@@ -1,15 +1,12 @@
 #pragma once
 
 #include <string>
-#include <atomic>
-#include <thread>
 #include <memory>
 #include <unordered_map>
 #include <chrono>
-#include <map>
 #include <vector>
 #include <filesystem>
-#include "thread_safe_queue.h"
+#include <atomic>
 #include "can_frame.h"
 
 namespace mdf {
@@ -53,10 +50,6 @@ class Mf4Writer {
 private:
     std::string output_directory_;
     std::string dbc_file_path_;
-    std::atomic<bool> running_;
-    std::shared_ptr<ThreadSafeQueue<DecodedSignal>> input_queue_;
-    std::unique_ptr<std::thread> writer_thread_;
-    
     std::unique_ptr<mdf::MdfWriter> mdf_writer_;
     std::string current_file_path_;
     size_t current_file_size_;
@@ -66,16 +59,13 @@ private:
     mdf::IDataGroup* data_group_;
     std::unordered_map<uint32_t, ChannelGroupInfo> channel_groups_;
     
-    // Buffer pour regrouper les signaux par message et timestamp
-    std::map<std::pair<uint32_t, uint64_t>, std::vector<DecodedSignal>> message_buffer_;
-    size_t buffered_signal_count_ = 0;
-
     // Gestion du temps de mesure
     std::chrono::steady_clock::time_point measurement_start_steady_;
     std::chrono::system_clock::time_point measurement_start_system_;
     uint64_t measurement_start_ns_;
     bool measurement_started_ = false;
     bool dbc_loaded_ = false;
+    std::atomic<bool> shutdown_requested_{false};
 
     std::unique_ptr<const dbcppp::INetwork> dbc_network_;
     std::vector<MessageDefinition> message_definitions_;
@@ -83,10 +73,7 @@ private:
     bool create_new_file();
     void close_current_file();
     std::string generate_filename();
-    void writer_loop();
-    void write_signal(const DecodedSignal& signal);
-    void write_can_message(const CanMessage& message);
-    void flush_message_buffer();
+    void write_can_message_internal(const CanMessage& message);
     ChannelGroupInfo* get_or_create_channel_group(uint32_t can_id);
     mdf::IChannel* get_or_create_channel(ChannelGroupInfo* cg_info, const DecodedSignal& signal);
     uint64_t compute_absolute_timestamp(const std::chrono::steady_clock::time_point& timestamp) const;
@@ -102,7 +89,8 @@ public:
     Mf4Writer(const Mf4Writer&) = delete;
     Mf4Writer& operator=(const Mf4Writer&) = delete;
 
-    bool start(std::shared_ptr<ThreadSafeQueue<DecodedSignal>> input_queue);
+    bool start();
     void stop();
-    bool is_running() const { return running_.load(); }
+    void write_can_message(const CanMessage& message);
+    bool is_running() const { return mdf_writer_ != nullptr; }
 };
