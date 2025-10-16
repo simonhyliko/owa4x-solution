@@ -1,0 +1,12 @@
+-std=c++17
+-Wall
+-Wextra
+-I.
+-Iinclude
+-Isrc
+-I/home/seloni/acq_json/include
+-I/opt/crosstool/owa4x/CC11.3/arm-gnu-toolchain-11.3.rel1-x86_64-arm-none-linux-gnueabihf/arm-none-linux-gnueabihf/usr/include
+-I/opt/crosstool/owa4x/CC11.3/arm-gnu-toolchain-11.3.rel1-x86_64-arm-none-linux-gnueabihf/arm-none-linux-gnueabihf/usr/include/mdf
+-DOWA4X
+-DVERSION="1.0.0"
+

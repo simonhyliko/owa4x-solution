@@ -1,0 +1,27 @@
+CompileFlags:
+  Add:
+    - "-std=c++17"
+    - "-Wall"
+    - "-Wextra"
+    - "-I."
+    - "-Iinclude"
+    - "-Isrc"
+    - "-I/opt/crosstool/owa4x/CC11.3/arm-gnu-toolchain-11.3.rel1-x86_64-arm-none-linux-gnueabihf/arm-none-linux-gnueabihf/usr/include"
+    - "-I/opt/crosstool/owa4x/CC11.3/arm-gnu-toolchain-11.3.rel1-x86_64-arm-none-linux-gnueabihf/arm-none-linux-gnueabihf/usr/include/mdf"
+    - "-I/opt/crosstool/owa4x/CC11.3/arm-gnu-toolchain-11.3.rel1-x86_64-arm-none-linux-gnueabihf/arm-none-linux-gnueabihf/usr/include/mdf4"
+    - "-DOWA4X"
+    - "-DVERSION=\"1.0.0\""
+  Remove:
+    - "-m*"
+    - "-f*"
+    - "--sysroot*"
+  Compiler: clang++
+
+Diagnostics:
+  UnusedIncludes: None
+  MissingIncludes: None
+  
+Index:
+  Background: Build
+
+

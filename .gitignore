@@ -1,0 +1,31 @@
+# Build artifacts
+dist/
+*.o
+*.a
+*.so
+*.deb
+can_socket_collector
+can_data_collector_pollux
+
+# MF4 output files
+*.mf4
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Clangd cache
+.cache/
+compile_commands.json
+
+# Temporary files
+*.tmp
+*.log
+
+
+# Project example content
+mf4_example/
+
